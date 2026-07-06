@@ -3,8 +3,8 @@
 import socket, threading
 
 # Creating constants
-DEST_IP = socket.gethostbyname(socket.gethostname())
-DEST_PORT = 54321
+DEST_IP = input("Enter the server IP address: ")
+DEST_PORT = 65432
 ENCODER = "utf-8"
 BYTESIZE = 1024
 

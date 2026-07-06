@@ -18,7 +18,8 @@ root.config(bg=black)
 class Connection():
     """will store a connection"""
     def __init__(self):
-        self.host_ip = socket.gethostbyname(socket.gethostname())
+        self.host_ip = "0.0.0.0"
+        self.lan_ip = socket.gethostbyname(socket.gethostname())
         self.encoder = "utf-8"
         self.bytesize = 1024
 
@@ -40,7 +41,7 @@ def start_server(connection):
 
     # Update GUI
     history_listbox.delete(0, END)
-    history_listbox.insert(0, f"Server started on port {connection.port}")
+    history_listbox.insert(0, f"Server started on {connection.lan_ip}:{connection.port}")
     end_button.config(state=NORMAL)
     self_broadcast_button.config(state=NORMAL)
     message_button.config(state=NORMAL)
