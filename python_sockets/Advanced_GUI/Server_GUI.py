@@ -14,18 +14,40 @@ black = "#010101"
 light_green = "#1fc742"
 root.config(bg=black)
 
+def get_lan_ip():
+    """Return the real LAN IP of this machine.
+
+    Uses the UDP-connect trick: connecting a UDP socket to a public IP
+    assigns the local endpoint that would be used to reach the internet,
+    without actually sending any packets. This reliably returns the real
+    LAN IP (e.g. 192.168.x.x) on macOS/Windows/Linux, unlike
+    socket.gethostbyname(socket.gethostname()) which often returns
+    127.0.0.1 or a Bonjour/internal address on macOS.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 # Creating a class to hold sockets and other info
 class Connection():
     """will store a connection"""
     def __init__(self):
         self.host_ip = "0.0.0.0"
-        self.lan_ip = socket.gethostbyname(socket.gethostname())
+        self.lan_ip = get_lan_ip()
         self.encoder = "utf-8"
         self.bytesize = 1024
 
         self.client_sockets = []
         self.client_ips = []
+        self.client_names = []
         self.banned_ips = []
+        self.lock = threading.Lock()
 
 
 # Define functions
@@ -69,21 +91,46 @@ def end_server(connection):
     ban_button.config(state=DISABLED)
     start_button.config(state=NORMAL)
 
+    # Close all client sockets and clear shared state safely
+    with connection.lock:
+        sockets = list(connection.client_sockets)
+        connection.client_sockets.clear()
+        connection.client_ips.clear()
+        connection.client_names.clear()
+        client_listbox.delete(0, END)
+
+    for client_sock in sockets:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
     # Close server socket
-    connection.server_socket.close()
+    try:
+        connection.server_socket.close()
+    except Exception:
+        pass
 
 def connect_client(connection):
     """Connection client to the server"""
     while True:
         try:
             client_socket, client_address = connection.server_socket.accept()
+        except Exception:
+            break
+
+        try:
             # check if the ip that is being connected to is banned
-            if client_address[0] in connection.banned_ips:
+            with connection.lock:
+                is_banned = client_address[0] in connection.banned_ips
+
+            if is_banned:
                 message_packet = create_message("DISCONNECT", "Admin (private)", "You have been banned...", light_green)
                 message_json = json.dumps(message_packet)
-                client_socket.send(message_json.encode(connection.encoder))
-
-                # Close client socket
+                try:
+                    client_socket.send(message_json.encode(connection.encoder))
+                except Exception:
+                    pass
                 client_socket.close()
             else:
                 # Send a message packet to recieve client info
@@ -93,9 +140,16 @@ def connect_client(connection):
 
                 # Wait for confirmation message to be sent
                 message_json = client_socket.recv(connection.bytesize)
-                process_message(connection, message_json, client_socket, client_address)
-        except:
-            break
+                if not message_json:
+                    client_socket.close()
+                else:
+                    process_message(connection, message_json, client_socket, client_address)
+        except Exception:
+            # A bad handshake for one client must not crash the accept loop
+            try:
+                client_socket.close()
+            except Exception:
+                pass
 
 def create_message(flag, name, message, color):
     """Return a message packet to be sent"""
@@ -116,20 +170,19 @@ def process_message(connection, message_json, client_socket, client_address=(0,0
     color = message_packet["color"]
 
     if flag == "INFO":
-        # add the new client information to appropriate lists
-        connection.client_sockets.append(client_socket)
-        connection.client_ips.append(client_address[0])
+        # add the new client information to appropriate lists (atomically)
+        with connection.lock:
+            connection.client_sockets.append(client_socket)
+            connection.client_ips.append(client_address[0])
+            connection.client_names.append(name)
+            client_listbox.insert(END, f"Name: {name}      IP Addr: {client_address[0]}")
 
         # Broadcast the new client joining
         message_packet = create_message("MESSAGE", "Admin (broadcast)", f"{name} has joined the chat!", light_green)
         message_json = json.dumps(message_packet)
         broadcast_message(connection, message_json.encode(connection.encoder))
 
-        # Update Server UI
-        client_listbox.insert(END, f"Name: {name}      IP Addr: {client_address[0]}")
-
         # A client has been established, start a thread to listen for messages from them constantly
-
         recieve_thread = threading.Thread(target=recieve_message, args=(connection, client_socket,))
         recieve_thread.start()
 
@@ -142,41 +195,86 @@ def process_message(connection, message_json, client_socket, client_address=(0,0
         history_listbox.itemconfig(0, fg=color)
 
     elif flag == "DISCONNECT":
-        # Close and remove client_socket
-        index = connection.client_sockets.index(client_socket)
-        connection.client_sockets.remove(client_socket)
-        connection.client_ips.pop(index)
-        client_listbox.delete(index)
-        client_socket.close()
-
-        # Alert all the user that a client has left the chat
-        message_pack = create_message("MESSAGE", "Admin (broadcast)", f"{name} has left the chat...", light_green)
-        message_json = json.dumps(message_pack)
-        broadcast_message(connection, message_json.encode(connection.encoder))
-        
-        # Update the server UI
-        history_listbox.insert(0, f"Admin (broadcast): {name} has left the server...")
+        # Close and remove client_socket (and notify everyone)
+        _drop_client(connection, client_socket, name)
 
     else:
         # catch for errors 
         history_listbox.insert(0, "ERROR processing message...")
 
 def broadcast_message(connection, message_json):
-    """Broadcast message to all connected client"""
-    for client_sock in connection.client_sockets:
-        client_sock.send(message_json)
+    """Broadcast message to all connected client.
+
+    A dropped client mid-broadcast no longer aborts the loop for everyone else:
+    we snapshot the socket list under the lock, send to each outside the lock,
+    and cleanly remove any socket that fails.
+    """
+    with connection.lock:
+        sockets = list(connection.client_sockets)
+
+    dead = []
+    for client_sock in sockets:
+        try:
+            client_sock.send(message_json)
+        except Exception:
+            dead.append(client_sock)
+
+    for client_sock in dead:
+        _drop_client(connection, client_sock)
+
+
+def _drop_client(connection, client_socket, name=None):
+    """Remove a client from shared state and notify everyone they left.
+
+    Safe to call multiple times for the same socket (idempotent). Used by the
+    DISCONNECT handler, by recieve_message on a hard drop, and by
+    broadcast_message when a send fails.
+    """
+    with connection.lock:
+        if client_socket not in connection.client_sockets:
+            return
+        index = connection.client_sockets.index(client_socket)
+        if name is None:
+            name = connection.client_names[index]
+        connection.client_sockets.pop(index)
+        connection.client_ips.pop(index)
+        connection.client_names.pop(index)
+        client_listbox.delete(index)
+
+    try:
+        client_socket.close()
+    except Exception:
+        pass
+
+    # Alert all remaining users that a client has left the chat
+    message_pack = create_message("MESSAGE", "Admin (broadcast)", f"{name} has left the chat...", light_green)
+    message_json = json.dumps(message_pack)
+    broadcast_message(connection, message_json.encode(connection.encoder))
+
+    # Update the server UI
+    history_listbox.insert(0, f"Admin (broadcast): {name} has left the server...")
 
 
 def recieve_message(connection, client_socket):
     """Recieve message from client"""
     while True:
-        # Get message_json from client
-        try: 
+        try:
             message_json = client_socket.recv(connection.bytesize)
-            process_message(connection, message_json, client_socket)
-
-        except:
+        except Exception:
+            # Network error -> client is gone, clean up and stop listening
+            _drop_client(connection, client_socket)
             break
+
+        if not message_json:
+            # recv returned b'' -> peer closed the connection cleanly
+            _drop_client(connection, client_socket)
+            break
+
+        try:
+            process_message(connection, message_json, client_socket)
+        except Exception:
+            # A malformed packet should not kill the listener or the server
+            history_listbox.insert(0, "ERROR processing message...")
 
 def self_broadcast(connection):
     """Broadcast a special admin message to all clients"""
@@ -190,14 +288,23 @@ def self_broadcast(connection):
 
 def private_message(connection):
     """Send a private message to a specific client"""
-    # Select client from client listbox and access their socket
-    index = client_listbox.curselection()[0]
-    client_socket = connection.client_sockets[index]
+    try:
+        index = client_listbox.curselection()[0]
+    except Exception:
+        return
+
+    with connection.lock:
+        if index >= len(connection.client_sockets):
+            return
+        client_socket = connection.client_sockets[index]
 
     # Create a message packet and send
     message_packet = create_message("MESSAGE", "Admin (private)", input_entry.get(), light_green)
     message_json = json.dumps(message_packet)
-    client_socket.send(message_json.encode(connection.encoder))
+    try:
+        client_socket.send(message_json.encode(connection.encoder))
+    except Exception:
+        _drop_client(connection, client_socket)
 
     # Clear input entry
     input_entry.delete(0, END)
@@ -205,28 +312,46 @@ def private_message(connection):
 
 def kick_client(connection):
     """Kick a specific client from Chat"""
-    # Select a client for the listbox
-    index = client_listbox.curselection()[0]
-    client_socket = connection.client_sockets[index]
+    try:
+        index = client_listbox.curselection()[0]
+    except Exception:
+        return
+
+    with connection.lock:
+        if index >= len(connection.client_sockets):
+            return
+        client_socket = connection.client_sockets[index]
 
     # Create the message packet
     message_packet = create_message("DISCONNECT", "Admin (private)", "You have been kicked...", light_green)
     message_json = json.dumps(message_packet)
-    client_socket.send(message_json.encode(connection.encoder))
-    
+    try:
+        client_socket.send(message_json.encode(connection.encoder))
+    except Exception:
+        _drop_client(connection, client_socket)
+
 
 def ban_client(connection):
     """Ban a client based on ip address"""
-    index = client_listbox.curselection()[0]
-    client_socket = connection.client_sockets[index]
+    try:
+        index = client_listbox.curselection()[0]
+    except Exception:
+        return
+
+    with connection.lock:
+        if index >= len(connection.client_sockets):
+            return
+        client_socket = connection.client_sockets[index]
+        client_ip = connection.client_ips[index]
+        connection.banned_ips.append(client_ip)
 
     # Create the message packet
     message_packet = create_message("DISCONNECT", "Admin (private)", "You have been banned...", light_green)
     message_json = json.dumps(message_packet)
-    client_socket.send(message_json.encode(connection.encoder))
-
-    # Ban the IP Address of the client
-    connection.banned_ips.append(connection.client_ips[index])
+    try:
+        client_socket.send(message_json.encode(connection.encoder))
+    except Exception:
+        _drop_client(connection, client_socket)
 
 
 # Define GUI Layout

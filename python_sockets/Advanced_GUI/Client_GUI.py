@@ -58,10 +58,17 @@ def connect(connection):
 
 def disconnect(connection):
     """Disconnect with the server"""
-    # Create a message packet to be sent 
+    # Create a message packet to be sent
     message_packet = create_message("DISCONNECT", connection.name, "I am Leaving.", connection.color)
     message_json = json.dumps(message_packet)
-    connection.client_socket.send(message_json.encode(connection.encoder))
+    try:
+        connection.client_socket.send(message_json.encode(connection.encoder))
+    except Exception:
+        pass
+    try:
+        connection.client_socket.close()
+    except Exception:
+        pass
 
     #Disable GUI
     gui_end()
@@ -151,16 +158,25 @@ def send_message(connection):
 
 def recieve_message(connection):
     """Recieve a message from the server"""
-    while True: 
-        # Recieve a incoming message pack from server
+    while True:
         try:
-
             message_json = connection.client_socket.recv(connection.bytesize)
-            process_message(connection, message_json)
-        except:
+        except Exception:
             # Can not recieve message close connection
             my_listbox.insert(0, "Connection has been closed...")
+            gui_end()
             break
+
+        if not message_json:
+            # Server closed the connection cleanly
+            my_listbox.insert(0, "Connection has been closed...")
+            gui_end()
+            break
+
+        try:
+            process_message(connection, message_json)
+        except Exception:
+            my_listbox.insert(0, "ERROR processing message...")
 
 # Define GUI Layout
 # Creating frames
