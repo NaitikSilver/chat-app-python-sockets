@@ -1,6 +1,7 @@
 # Server GUI Chat room (admin)
 import tkinter, socket, threading, json
 from tkinter import DISABLED, VERTICAL, END, NORMAL
+import chat_db  # this is our postgres logging module (only the server uses it)
 
 # Define window
 root = tkinter.Tk()
@@ -61,9 +62,17 @@ def start_server(connection):
     connection.server_socket.bind((connection.host_ip, connection.port))
     connection.server_socket.listen()
 
+    # hook up the postgres database so chat messages get saved
+    try:
+        chat_db.init_db()
+        db_status = "DB connected"
+    except Exception as e:
+        db_status = f"DB failed: {e}"
+        history_listbox.insert(0, db_status)
+
     # Update GUI
     history_listbox.delete(0, END)
-    history_listbox.insert(0, f"Server started on {connection.lan_ip}:{connection.port}")
+    history_listbox.insert(0, f"Server started on {connection.lan_ip}:{connection.port} ({db_status})")
     end_button.config(state=NORMAL)
     self_broadcast_button.config(state=NORMAL)
     message_button.config(state=NORMAL)
@@ -108,6 +117,12 @@ def end_server(connection):
     # Close server socket
     try:
         connection.server_socket.close()
+    except Exception:
+        pass
+
+    # Shut down the database connection pool since we are done logging
+    try:
+        chat_db.close_db()
     except Exception:
         pass
 
@@ -161,6 +176,24 @@ def create_message(flag, name, message, color):
     }
     return message_packet
 
+def log_to_db(name, message, color, flag, ip_address=None):
+    """Save a message to the postgres db so we can look at chat history later.
+
+    Wrapped in try/except so if the db has a problem the chat still works fine.
+    """
+    try:
+        chat_db.log_message(name, message, color, flag, ip_address)
+    except Exception as e:
+        history_listbox.insert(0, f"DB error: {e}")
+
+def _ip_for_socket(connection, client_socket):
+    """Find the ip address for a given client socket (or None if not found)."""
+    with connection.lock:
+        if client_socket in connection.client_sockets:
+            index = connection.client_sockets.index(client_socket)
+            return connection.client_ips[index]
+    return None
+
 def process_message(connection, message_json, client_socket, client_address=(0,0)):
     """Update server info based on packet flag"""
     message_packet = json.loads(message_json) # decode and turn into dict
@@ -182,6 +215,9 @@ def process_message(connection, message_json, client_socket, client_address=(0,0
         message_json = json.dumps(message_packet)
         broadcast_message(connection, message_json.encode(connection.encoder))
 
+        # log the join event to the database
+        log_to_db("Admin (broadcast)", f"{name} has joined the chat!", light_green, "INFO", ip_address=client_address[0])
+
         # A client has been established, start a thread to listen for messages from them constantly
         recieve_thread = threading.Thread(target=recieve_message, args=(connection, client_socket,))
         recieve_thread.start()
@@ -193,6 +229,10 @@ def process_message(connection, message_json, client_socket, client_address=(0,0
         # Update server UI
         history_listbox.insert(0, f"{name}: {message}")
         history_listbox.itemconfig(0, fg=color)
+
+        # save the actual chat message to the db (look up the senders ip too)
+        sender_ip = _ip_for_socket(connection, client_socket)
+        log_to_db(name, message, color, "MESSAGE", ip_address=sender_ip)
 
     elif flag == "DISCONNECT":
         # Close and remove client_socket (and notify everyone)
@@ -236,6 +276,8 @@ def _drop_client(connection, client_socket, name=None):
         index = connection.client_sockets.index(client_socket)
         if name is None:
             name = connection.client_names[index]
+        # grab the ip before we remove them, so we can log who left
+        left_ip = connection.client_ips[index]
         connection.client_sockets.pop(index)
         connection.client_ips.pop(index)
         connection.client_names.pop(index)
@@ -253,6 +295,9 @@ def _drop_client(connection, client_socket, name=None):
 
     # Update the server UI
     history_listbox.insert(0, f"Admin (broadcast): {name} has left the server...")
+
+    # log the leave event to the database
+    log_to_db("Admin (broadcast)", f"{name} has left the chat...", light_green, "DISCONNECT", ip_address=left_ip)
 
 
 def recieve_message(connection, client_socket):
@@ -283,6 +328,9 @@ def self_broadcast(connection):
     message_json = json.dumps(message_packet)
     broadcast_message(connection, message_json.encode(connection.encoder))
 
+    # log the admin broadcast to the db
+    log_to_db("Admine (broadcast)", input_entry.get(), light_green, "MESSAGE")
+
     # Clear input entry
     input_entry.delete(0, END)
 
@@ -297,6 +345,7 @@ def private_message(connection):
         if index >= len(connection.client_sockets):
             return
         client_socket = connection.client_sockets[index]
+        client_ip = connection.client_ips[index]
 
     # Create a message packet and send
     message_packet = create_message("MESSAGE", "Admin (private)", input_entry.get(), light_green)
@@ -305,6 +354,10 @@ def private_message(connection):
         client_socket.send(message_json.encode(connection.encoder))
     except Exception:
         _drop_client(connection, client_socket)
+        return
+
+    # log the private message to the db (with the target ip)
+    log_to_db("Admin (private)", input_entry.get(), light_green, "MESSAGE", ip_address=client_ip)
 
     # Clear input entry
     input_entry.delete(0, END)
